@@ -1,0 +1,374 @@
+#!/bin/bash
+set -uo pipefail
+
+XRAY_CONF="/usr/local/etc/xray/config.json"
+XRAY_DIR="/usr/local/etc/xray"
+GEO_DIR="/usr/local/share/xray"
+
+# =============================================================================
+# Выбор конфига outbound происходит автоматически по значению параметра type:
+#   type=xhttp  → outbound через xhttp (REALITY)
+#   type=tcp    → outbound через tcp   (REALITY + xtls-rprx-vision)
+# =============================================================================
+
+# ─── 1. ПАРСИНГ VLESS-ССЫЛКИ ─────────────────────────────────────────────────
+
+parse_vless() {
+    local url="${1:-}"
+
+    if [[ -z "$url" ]]; then
+        echo "Usage: $0 <vless://...>" >&2
+        exit 1
+    fi
+
+    if [[ "$url" != vless://* ]]; then
+        echo "Error: not a vless:// URL" >&2
+        exit 1
+    fi
+
+    local rest="${url#vless://}"
+
+    # fragment (#name)
+    name=""
+    if [[ "$rest" == *"#"* ]]; then
+        name="${rest##*#}"
+        name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$name" 2>/dev/null || printf '%s' "$name")
+        rest="${rest%%#*}"
+    fi
+    if [[ -z "$name" ]]; then
+        name="proxy-$(date +%s)"
+        echo "Внимание: имя (fragment) не найдено в ссылке, использую tag: $name" >&2
+    fi
+
+    # id (до @)
+    id="${rest%%@*}"
+    rest="${rest#*@}"
+
+    # host:port (до ?)
+    local hostport="${rest%%\?*}"
+    local query=""
+    if [[ "$rest" == *"?"* ]]; then
+        query="${rest#*\?}"
+    fi
+
+    # IPv6 или обычный host:port
+    if [[ "$hostport" == "["* ]]; then
+        address="${hostport%%]*}"
+        address="${address#[}"
+        port="${hostport##*]:}"
+    else
+        address="${hostport%%:*}"
+        port="${hostport##*:}"
+    fi
+
+    # query-параметры
+    declare -gA params
+    local IFS='&'
+    for pair in $query; do
+        local k="${pair%%=*}"
+        local v="${pair#*=}"
+        v=$(python3 -c "import urllib.parse,sys; print(urllib.parse.unquote(sys.argv[1]))" "$v" 2>/dev/null || printf '%s' "$v")
+        params["$k"]="$v"
+    done
+
+    # Присваиваем глобальные переменные (без local!)
+    publickey="${params[pbk]:-}"
+    fingerprint="${params[fp]:-}"
+    servername="${params[sni]:-}"
+    shortid="${params[sid]:-}"
+    security="${params[security]:-}"
+    transport_type="${params[type]:-}"
+    flow="${params[flow]:-}"
+    encryption="${params[encryption]:-}"
+
+    # ─ Валидация обязательных полей ─
+    local missing=()
+    [[ -z "$id" ]] && missing+=("id/uuid")
+    [[ -z "$address" ]] && missing+=("address")
+    [[ -z "$port" ]] && missing+=("port")
+    [[ -z "$publickey" ]] && missing+=("pbk (publicKey)")
+    [[ -z "$servername" ]] && missing+=("sni (serverName)")
+    [[ "$security" != "reality" ]] && missing+=("security=reality (получено: '$security')")
+
+    if (( ${#missing[@]} > 0 )); then
+        echo "Error: в ссылке отсутствуют/некорректны обязательные параметры:" >&2
+        printf '  - %s\n' "${missing[@]}" >&2
+        exit 1
+    fi
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo "Error: port не является числом: '$port'" >&2
+        exit 1
+    fi
+}
+
+# ─── 2. ГЕОФАЙЛЫ. МАРШРУТИЗАЦИЯ ─────────────────────────────────────────────
+
+update_geo_files() {
+    echo ">>> Обновление geo-файлов..."
+    mkdir -p "$GEO_DIR"
+    rm -f "$GEO_DIR"/geoip.dat "$GEO_DIR"/geosite.dat
+    wget -q --show-progress -P "$GEO_DIR/" \
+        https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat || { echo "Ошибка загрузки geoip.dat"; exit 1; }
+    wget -q --show-progress -P "$GEO_DIR/" \
+        https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat || { echo "Ошибка загрузки geosite.dat"; exit 1; }
+}
+
+backup_config() {
+    echo ">>> Создание резервной копии config.json..."
+    cp "$XRAY_CONF" "$XRAY_CONF.backup.$(date +%Y%m%d%H%M%S)"
+    cp "$XRAY_CONF" "$XRAY_CONF.backup"
+}
+
+restore_backup() {
+    echo "Откат к резервной копии из-за ошибки..." >&2
+    cp "$XRAY_CONF.backup" "$XRAY_CONF"
+}
+
+patch_routing() {
+    echo ">>> Обновление routing rules..."
+    local tmp
+    tmp=$(mktemp "$XRAY_DIR/tmp.XXXXXX.json")
+    jq --arg name "$name" \
+    '.routing.rules = [
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "domain": [
+          "ext:geosite.dat:ru-available-only-inside",
+          "regexp:.*\\.ru$",
+          "regexp:.*\\.su$",
+          "regexp:.*\\.xn--p1ai$"
+        ]
+      },
+      {
+        "type": "field",
+        "outboundTag": "direct",
+        "ip": ["ext:geoip.dat:ru"]
+      },
+      {
+        "type": "field",
+        "outboundTag": "block",
+        "domain": ["geosite:category-ads-all"]
+      },
+      {
+        "type": "field",
+        "outboundTag": $name,
+        "network": "TCP,UDP"
+      }
+    ]' "$XRAY_CONF" > "$tmp" && mv "$tmp" "$XRAY_CONF"
+}
+
+write_renew_script() {
+    echo ">>> Создание скрипта обновления geo-файлов..."
+    mkdir -p /usr/local/share/renewgeo/
+    cat > /usr/local/share/renewgeo/renewgeofiles << 'EOF'
+#!/bin/bash
+set -euo pipefail
+GEO_DIR="/usr/local/share/xray"
+mkdir -p "$GEO_DIR"
+rm -f "$GEO_DIR"/geoip.dat "$GEO_DIR"/geosite.dat
+wget -q -P "$GEO_DIR/" https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+wget -q -P "$GEO_DIR/" https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+systemctl restart xray
+EOF
+    chmod +x /usr/local/share/renewgeo/renewgeofiles
+
+    # Автоматическое еженедельное обновление (если ещё не добавлено)
+    local cron_line="0 4 * * 1 /usr/local/share/renewgeo/renewgeofiles >/var/log/renewgeo.log 2>&1"
+    (crontab -l 2>/dev/null | grep -qF "renewgeofiles") || \
+        (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
+}
+
+restart_xray() {
+    echo ">>> Проверка валидности конфига перед перезапуском..."
+    if ! xray run -test -config "$XRAY_CONF"; then
+        echo "Конфиг невалиден!" >&2
+        restore_backup
+        exit 1
+    fi
+    echo ">>> Перезапуск Xray..."
+    systemctl restart xray
+    sleep 1
+    systemctl --no-pager status xray || true
+}
+
+# ─── 3. OUTBOUND: XHTTP (type=xhttp) ─────────────────────────────────────────
+
+patch_outbound_xhttp() {
+    echo ">>> Применение outbound конфига: xhttp / REALITY..."
+    local tmp
+    tmp=$(mktemp "$XRAY_DIR/tmp.XXXXXX.json")
+    jq --arg address      "$address" \
+       --argjson port     "$port" \
+       --arg id           "$id" \
+       --arg name         "$name" \
+       --arg publickey    "$publickey" \
+       --arg fingerprint  "$fingerprint" \
+       --arg servername   "$servername" \
+       --arg shortid      "$shortid" \
+    '
+    .outbounds = (
+      .outbounds | map(select(.tag != "direct" and .tag != $name))
+    ) + [
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "AsIs",
+          "redirect": "",
+          "noises": []
+        }
+      },
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": $address,
+          "port": $port,
+          "id": $id,
+          "flow": "",
+          "encryption": "none"
+        },
+        "tag": $name,
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "reality",
+          "realitySettings": {
+            "publicKey": $publickey,
+            "fingerprint": $fingerprint,
+            "serverName": $servername,
+            "shortId": $shortid,
+            "spiderX": "/"
+          },
+          "xhttpSettings": {
+            "path": "/",
+            "host": "",
+            "mode": "auto",
+            "noGRPCHeader": false,
+            "scMinPostsIntervalMs": "30",
+            "xmux": {
+              "maxConcurrency": "16-32",
+              "maxConnections": 0,
+              "cMaxReuseTimes": 0,
+              "hMaxRequestTimes": "600-900",
+              "hMaxReusableSecs": "1800-3000",
+              "hKeepAlivePeriod": 0
+            }
+          }
+        }
+      }
+    ]' "$XRAY_CONF" > "$tmp" && mv "$tmp" "$XRAY_CONF"
+}
+
+# ─── 4. OUTBOUND: TCP (type=tcp) ─────────────────────────────────────────────
+
+patch_outbound_tcp() {
+    echo ">>> Применение outbound конфига: tcp / REALITY + xtls-rprx-vision..."
+    local tmp
+    tmp=$(mktemp "$XRAY_DIR/tmp.XXXXXX.json")
+    jq --arg address      "$address" \
+       --argjson port     "$port" \
+       --arg id           "$id" \
+       --arg name         "$name" \
+       --arg publickey    "$publickey" \
+       --arg fingerprint  "$fingerprint" \
+       --arg servername   "$servername" \
+       --arg shortid      "$shortid" \
+    '
+    .outbounds = (
+      .outbounds | map(select(.tag != "direct" and .tag != $name))
+    ) + [
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {
+          "domainStrategy": "AsIs",
+          "redirect": "",
+          "noises": []
+        }
+      },
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": $address,
+          "port": $port,
+          "id": $id,
+          "flow": "xtls-rprx-vision",
+          "encryption": "none"
+        },
+        "tag": $name,
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "publicKey": $publickey,
+            "fingerprint": $fingerprint,
+            "serverName": $servername,
+            "shortId": $shortid,
+            "spiderX": "/"
+          },
+          "tcpSettings": {
+            "header": {
+              "type": "none"
+            }
+          }
+        }
+      }
+    ]' "$XRAY_CONF" > "$tmp" && mv "$tmp" "$XRAY_CONF"
+}
+
+# ─── 5. ТОЧКА ВХОДА ───────────────────────────────────────────────────────────
+
+main() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "Запустите скрипт от root" >&2
+        exit 1
+    fi
+
+    for bin in jq wget python3 xray; do
+        command -v "$bin" >/dev/null 2>&1 || { echo "Не найдена команда: $bin" >&2; exit 1; }
+    done
+
+    [[ -f "$XRAY_CONF" ]] || { echo "Не найден $XRAY_CONF" >&2; exit 1; }
+
+    local vless_url="${1:-}"
+
+    if [[ -z "$vless_url" ]]; then
+        read -rp "Вставьте vless-ссылку: " vless_url </dev/tty
+    fi
+
+    parse_vless "$vless_url"
+
+    echo ""
+    echo "=== Параметры подключения ==="
+    echo "  name:        $name"
+    echo "  address:     $address"
+    echo "  port:        $port"
+    echo "  type:        $transport_type"
+    echo "  security:    $security"
+    echo "  servername:  $servername"
+    echo ""
+
+    update_geo_files
+    backup_config
+    patch_routing || { restore_backup; exit 1; }
+
+    case "$transport_type" in
+        xhttp)
+            patch_outbound_xhttp || { restore_backup; exit 1; }
+            ;;
+        tcp)
+            patch_outbound_tcp || { restore_backup; exit 1; }
+            ;;
+        *)
+            echo "Error: неизвестный type='$transport_type'. Поддерживаются: xhttp, tcp." >&2
+            restore_backup
+            exit 1
+            ;;
+    esac
+
+    write_renew_script
+    restart_xray
+}
+
+main "$@"
